@@ -18,12 +18,14 @@ app = FastAPI()
 # CONSTANTS
 # =====================================================
 EMOTION_LABELS = [
-    'Angry', 'Disgust', 'Fear',
-    'Happy', 'Sad', 'Surprise', 'Neutral'
+    "Angry", "Disgust", "Fear",
+    "Happy", "Sad", "Surprise", "Neutral"
 ]
 
 YOLOV8_MODEL_PATH = "yolov8n-face-lindevs.pt"
 EMOTION_MODEL_PATH = "FER_dinamic_LSTM_SAVEE.pt"
+
+DEVICE = torch.device("cpu")
 
 # =====================================================
 # MODEL DEFINITION (MATCHES STATE_DICT)
@@ -51,14 +53,14 @@ print("Loading YOLO face model...")
 face_detector = YOLO(YOLOV8_MODEL_PATH)
 
 print("Loading emotion LSTM model...")
-emotion_model = EmotionLSTMModel()
+emotion_model = EmotionLSTMModel().to(DEVICE)
 emotion_model.load_state_dict(
-    torch.load(EMOTION_MODEL_PATH, map_location="cpu")
+    torch.load(EMOTION_MODEL_PATH, map_location=DEVICE)
 )
 emotion_model.eval()
 
-# Temporary feature mapper (same as notebook)
-feature_mapper = nn.Linear(48 * 48, 512)
+# Feature mapper (matches notebook)
+feature_mapper = nn.Linear(48 * 48, 512).to(DEVICE)
 
 print("Models loaded successfully")
 
@@ -69,7 +71,7 @@ print("Models loaded successfully")
 async def predict(file: UploadFile = File(...)):
     try:
         # ---------------------------------------------
-        # READ IMAGE FROM WEBSITE
+        # READ IMAGE FROM CLIENT
         # ---------------------------------------------
         image_bytes = await file.read()
         pil_image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
@@ -102,7 +104,7 @@ async def predict(file: UploadFile = File(...)):
         # ---------------------------------------------
         face = cv2.cvtColor(face, cv2.COLOR_BGR2GRAY)
         face = cv2.resize(face, (48, 48), interpolation=cv2.INTER_AREA)
-        face = torch.tensor(face).float() / 255.0
+        face = torch.tensor(face, dtype=torch.float32, device=DEVICE) / 255.0
         face = face.view(1, -1)  # (1, 2304)
 
         # ---------------------------------------------
@@ -117,7 +119,7 @@ async def predict(file: UploadFile = File(...)):
         with torch.no_grad():
             logits = emotion_model(model_input)
             probs = F.softmax(logits, dim=1)
-            emotion = EMOTION_LABELS[torch.argmax(probs).item()]
+            emotion = EMOTION_LABELS[torch.argmax(probs, dim=1).item()]
 
         return {"emotion": emotion}
 
@@ -125,15 +127,14 @@ async def predict(file: UploadFile = File(...)):
         return {"error": str(e)}
 
 # =====================================================
-# RENDER ENTRY POINT (CRITICAL)
+# RENDER ENTRY POINT
 # =====================================================
 if __name__ == "__main__":
     import uvicorn
 
     port = int(os.environ.get("PORT", 8000))
     uvicorn.run(
-        "server:app",
+        app,
         host="0.0.0.0",
-        port=port,
-        workers=1
+        port=port
     )
