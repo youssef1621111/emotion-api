@@ -1,3 +1,5 @@
+import os
+import io
 import cv2
 import torch
 import torch.nn as nn
@@ -6,15 +8,26 @@ import numpy as np
 from fastapi import FastAPI, UploadFile, File
 from ultralytics import YOLO
 from PIL import Image
-import io
 
+# =====================================================
+# FASTAPI APP
+# =====================================================
 app = FastAPI()
 
-EMOTION_LABELS = ['Angry', 'Disgust', 'Fear', 'Happy', 'Sad', 'Surprise', 'Neutral']
+# =====================================================
+# CONSTANTS
+# =====================================================
+EMOTION_LABELS = [
+    'Angry', 'Disgust', 'Fear',
+    'Happy', 'Sad', 'Surprise', 'Neutral'
+]
 
-# =========================
-# MODEL
-# =========================
+YOLOV8_MODEL_PATH = "yolov8n-face-lindevs.pt"
+EMOTION_MODEL_PATH = "FER_dinamic_LSTM_SAVEE.pt"
+
+# =====================================================
+# MODEL DEFINITION (MATCHES STATE_DICT)
+# =====================================================
 class EmotionLSTMModel(nn.Module):
     def __init__(self):
         super().__init__()
@@ -31,56 +44,96 @@ class EmotionLSTMModel(nn.Module):
         x = x[:, -1, :]
         return self.fc(x)
 
-# =========================
-# LOAD MODELS ONCE
-# =========================
-face_detector = YOLO("yolov8n-face-lindevs.pt")
+# =====================================================
+# LOAD MODELS ONCE (CRITICAL)
+# =====================================================
+print("Loading YOLO face model...")
+face_detector = YOLO(YOLOV8_MODEL_PATH)
 
+print("Loading emotion LSTM model...")
 emotion_model = EmotionLSTMModel()
-emotion_model.load_state_dict(torch.load("FER_dinamic_LSTM_SAVEE.pt", map_location="cpu"))
+emotion_model.load_state_dict(
+    torch.load(EMOTION_MODEL_PATH, map_location="cpu")
+)
 emotion_model.eval()
 
-feature_mapper = nn.Linear(2304, 512)
+# Temporary feature mapper (same as notebook)
+feature_mapper = nn.Linear(48 * 48, 512)
 
-# =========================
+print("Models loaded successfully")
+
+# =====================================================
 # API ENDPOINT
-# =========================
+# =====================================================
 @app.post("/predict")
 async def predict(file: UploadFile = File(...)):
-    # READ IMAGE FROM WEBSITE
-    img_bytes = await file.read()
-    pil_img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-    image = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+    try:
+        # ---------------------------------------------
+        # READ IMAGE FROM WEBSITE
+        # ---------------------------------------------
+        image_bytes = await file.read()
+        pil_image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        image = cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGB2BGR)
 
-    # FACE DETECTION
-    results = face_detector(image)
-    largest_face = None
-    max_area = 0
+        # ---------------------------------------------
+        # FACE DETECTION
+        # ---------------------------------------------
+        results = face_detector(image)
 
-    for r in results:
-        for box in r.boxes:
-            x1, y1, x2, y2 = map(int, box.xyxy[0])
-            area = (x2 - x1) * (y2 - y1)
-            if area > max_area:
-                max_area = area
-                largest_face = (x1, y1, x2, y2)
+        largest_face = None
+        max_area = 0
 
-    if largest_face is None:
-        return {"error": "no face detected"}
+        for r in results:
+            for box in r.boxes:
+                x1, y1, x2, y2 = map(int, box.xyxy[0])
+                area = (x2 - x1) * (y2 - y1)
+                if area > max_area:
+                    max_area = area
+                    largest_face = (x1, y1, x2, y2)
 
-    x1, y1, x2, y2 = largest_face
-    face = image[y1:y2, x1:x2]
+        if largest_face is None:
+            return {"error": "No face detected"}
 
-    # PREPROCESS
-    face = cv2.cvtColor(face, cv2.COLOR_BGR2GRAY)
-    face = cv2.resize(face, (48, 48))
-    face = torch.tensor(face).float() / 255.0
-    face = face.view(1, -1)
+        x1, y1, x2, y2 = largest_face
+        face = image[y1:y2, x1:x2]
 
-    mapped = feature_mapper(face).unsqueeze(1)
+        # ---------------------------------------------
+        # PREPROCESS (NOTEBOOK LOGIC)
+        # ---------------------------------------------
+        face = cv2.cvtColor(face, cv2.COLOR_BGR2GRAY)
+        face = cv2.resize(face, (48, 48), interpolation=cv2.INTER_AREA)
+        face = torch.tensor(face).float() / 255.0
+        face = face.view(1, -1)  # (1, 2304)
 
-    with torch.no_grad():
-        out = emotion_model(mapped)
-        emotion = EMOTION_LABELS[out.argmax(1).item()]
+        # ---------------------------------------------
+        # FEATURE MAPPING + LSTM INPUT
+        # ---------------------------------------------
+        mapped = feature_mapper(face)
+        model_input = mapped.unsqueeze(1)  # (1, 1, 512)
 
-    return {"emotion": emotion}
+        # ---------------------------------------------
+        # EMOTION PREDICTION
+        # ---------------------------------------------
+        with torch.no_grad():
+            logits = emotion_model(model_input)
+            probs = F.softmax(logits, dim=1)
+            emotion = EMOTION_LABELS[torch.argmax(probs).item()]
+
+        return {"emotion": emotion}
+
+    except Exception as e:
+        return {"error": str(e)}
+
+# =====================================================
+# RENDER ENTRY POINT (CRITICAL)
+# =====================================================
+if __name__ == "__main__":
+    import uvicorn
+
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(
+        "server:app",
+        host="0.0.0.0",
+        port=port,
+        workers=1
+    )
